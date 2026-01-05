@@ -38,14 +38,14 @@
                     <span>Workspaces</span>
                 </a>
 
-                <a href="{{ route('api-runner') }}"
+                <!-- <a href="{{ route('api-runner') }}"
                    wire:navigate
                    class="flex items-center gap-3 px-4 py-3 rounded-lg transition-all {{ request()->routeIs('api-runner*') ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-700' }}">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
                     </svg>
                     <span>API Runner</span>
-                </a>
+                </a> -->
             </nav>
 
             <!-- User Menu -->

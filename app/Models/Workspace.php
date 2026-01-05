@@ -58,6 +58,16 @@ class Workspace extends Model
         return $this->hasMany(ApiRequest::class)->whereNull('collection_id')->orderBy('order');
     }
 
+    public function environments()
+    {
+        return $this->hasMany(ApiEnvironment::class)->orderBy('order');
+    }
+
+    public function activeEnvironment()
+    {
+        return $this->hasOne(ApiEnvironment::class)->where('is_active', true);
+    }
+
     // Scopes
     public function scopeOfType($query, $type)
     {

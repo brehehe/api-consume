@@ -2,7 +2,7 @@
 
 namespace App\Livewire\ApiRunner;
 
-use App\Models\{Workspace, ApiCollection, ApiRequest};
+use App\Models\{Workspace, ApiCollection, ApiRequest, ApiEnvironment, ApiEnvironmentVariable};
 use Livewire\Component;
 use Livewire\Attributes\Url;
 use Illuminate\Support\Facades\Http;
@@ -45,8 +45,19 @@ class ApiRunner extends Component
     public $itemToDeleteType = null;
     public $itemToDeleteId = null;
 
+    // Environment Management
+    public $activeEnvironment = null;
+    public $environments = [];
+    public $showEnvironmentModal = false;
+    public $editingEnvironment = null;
+    public $environmentVariables = [];
+    public $environmentTab = 'list'; // 'list' or 'variables'
+    public $newEnvironmentName = '';
+    public $newEnvironmentDescription = '';
+
     protected $rules = [
         'newItemName' => 'required|min:1|max:255',
+        'newEnvironmentName' => 'required|min:1|max:255',
     ];
 
     public function openCreateCollectionModal($parentId = null)
@@ -148,12 +159,15 @@ class ApiRunner extends Component
         $this->workspace = Workspace::with([
             'rootCollections.requests',
             'rootCollections.children.requests',
-            'rootRequests'
+            'rootRequests',
+            'activeEnvironment.enabledVariables'
         ])->findOrFail($workspace);
 
         if (!$this->workspace->isMember(auth()->id()) && $this->workspace->type !== 'public') {
             abort(403);
         }
+
+        $this->loadEnvironments();
 
         if ($request) {
             $this->selectRequest($request, $collection);
@@ -313,20 +327,22 @@ class ApiRunner extends Component
     {
         $client = Http::timeout(30)->acceptJson();
 
-        // Apply headers
+        // Apply headers with variable interpolation
         foreach ($this->requestHeaders as $header) {
             if (($header['enabled'] ?? true) && !empty($header['key'])) {
-                $client->withHeaders([$header['key'] => $header['value']]);
+                $client->withHeaders([
+                    $header['key'] => $this->interpolateVariables($header['value'])
+                ]);
             }
         }
 
-        // Apply authentication
+        // Apply authentication with variable interpolation
         if ($this->requestAuthType === 'bearer' && !empty($this->requestAuthData['token'])) {
-            $client->withToken($this->requestAuthData['token']);
+            $client->withToken($this->interpolateVariables($this->requestAuthData['token']));
         } elseif ($this->requestAuthType === 'basic') {
             $client->withBasicAuth(
-                $this->requestAuthData['username'] ?? '',
-                $this->requestAuthData['password'] ?? ''
+                $this->interpolateVariables($this->requestAuthData['username'] ?? ''),
+                $this->interpolateVariables($this->requestAuthData['password'] ?? '')
             );
         }
 
@@ -335,12 +351,12 @@ class ApiRunner extends Component
 
     protected function buildRequestUrl(): string
     {
-        $url = $this->requestUrl;
+        $url = $this->interpolateVariables($this->requestUrl);
         $method = strtolower($this->requestMethod);
 
-        // For non-GET methods, append query params to URL
+        // For non-GET methods, append query params to URL with variable interpolation
         if ($method !== 'get') {
-            $queryParams = $this->getEnabledParams($this->requestQueryParams);
+            $queryParams = $this->interpolateArray($this->getEnabledParams($this->requestQueryParams));
             if (!empty($queryParams)) {
                 $url .= (str_contains($url, '?') ? '&' : '?') . http_build_query($queryParams);
             }
@@ -354,7 +370,7 @@ class ApiRunner extends Component
         $method = strtolower($this->requestMethod);
 
         if ($method === 'get') {
-            return $client->get($url, $this->getEnabledParams($this->requestQueryParams));
+            return $client->get($url, $this->interpolateArray($this->getEnabledParams($this->requestQueryParams)));
         }
 
         return match ($this->requestBodyType) {
@@ -379,7 +395,7 @@ class ApiRunner extends Component
                     $item['file']->getClientOriginalName()
                 );
             } else {
-                $data[$item['key']] = $item['value'];
+                $data[$item['key']] = $this->interpolateVariables($item['value']);
             }
         }
 
@@ -389,15 +405,28 @@ class ApiRunner extends Component
     protected function sendFormRequest($client, string $method, string $url)
     {
         $client->asForm();
-        $data = $this->getEnabledParams($this->requestFormUrlEncoded);
+        $data = $this->interpolateArray($this->getEnabledParams($this->requestFormUrlEncoded));
         return $client->$method($url, $data);
     }
 
     protected function sendJsonOrRawRequest($client, string $method, string $url)
     {
-        $body = $this->requestBodyType === 'json'
-            ? json_decode($this->requestBody, true)
-            : $this->requestBody;
+        if ($this->requestBodyType === 'json') {
+            $interpolatedBody = $this->interpolateVariables($this->requestBody);
+
+            // Allow empty body
+            if (empty(trim($interpolatedBody))) {
+                $body = [];
+            } else {
+                $body = json_decode($interpolatedBody, true);
+
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    throw new \Exception("Invalid JSON format: " . json_last_error_msg() . ". Ensure keys are quoted (e.g., \"key\": \"value\").");
+                }
+            }
+        } else {
+            $body = $this->interpolateVariables($this->requestBody);
+        }
 
         return $client->$method($url, $body ?? []);
     }
@@ -412,6 +441,183 @@ class ApiRunner extends Component
         }
         return $enabled;
     }
+
+    // Environment Management Methods
+    public function loadEnvironments()
+    {
+        $this->environments = $this->workspace->environments()->with('variables')->get();
+        $this->activeEnvironment = $this->workspace->activeEnvironment;
+    }
+
+    public function openEnvironmentModal()
+    {
+        $this->loadEnvironments();
+        $this->showEnvironmentModal = true;
+        $this->environmentTab = 'list';
+        $this->editingEnvironment = null;
+        $this->newEnvironmentName = '';
+        $this->newEnvironmentDescription = '';
+    }
+
+    public function selectEnvironment($environmentId)
+    {
+        $environment = ApiEnvironment::findOrFail($environmentId);
+        $environment->activate();
+        $this->loadEnvironments();
+    }
+
+    public function createEnvironment()
+    {
+        $this->validate([
+            'newEnvironmentName' => 'required|min:1|max:255',
+        ]);
+
+        ApiEnvironment::create([
+            'workspace_id' => $this->workspace->id,
+            'name' => $this->newEnvironmentName,
+            'description' => $this->newEnvironmentDescription,
+            'order' => $this->environments->count(),
+            'is_active' => $this->environments->isEmpty(), // First environment is auto-activated
+        ]);
+
+        $this->newEnvironmentName = '';
+        $this->newEnvironmentDescription = '';
+        $this->loadEnvironments();
+    }
+
+    public function editEnvironment($environmentId)
+    {
+        $this->editingEnvironment = ApiEnvironment::with('variables')->findOrFail($environmentId);
+        $this->environmentVariables = $this->editingEnvironment->variables->map(function ($var) {
+            return [
+                'id' => $var->id,
+                'key' => $var->key,
+                'value' => $var->value,
+                'description' => $var->description ?? '',
+                'is_secret' => $var->is_secret,
+                'enabled' => $var->enabled,
+            ];
+        })->toArray();
+        $this->environmentTab = 'variables';
+    }
+
+    public function deleteEnvironment($environmentId)
+    {
+        $environment = ApiEnvironment::findOrFail($environmentId);
+
+        // If deleting active environment, activate another one
+        if ($environment->is_active && $this->environments->count() > 1) {
+            $nextEnv = $this->environments->where('id', '!=', $environmentId)->first();
+            if ($nextEnv) {
+                $nextEnv->activate();
+            }
+        }
+
+        $environment->delete();
+        $this->loadEnvironments();
+    }
+
+    public function addEnvironmentVariable()
+    {
+        $this->environmentVariables[] = [
+            'id' => null,
+            'key' => '',
+            'value' => '',
+            'description' => '',
+            'is_secret' => false,
+            'enabled' => true,
+        ];
+    }
+
+    public function removeEnvironmentVariable($index)
+    {
+        if (isset($this->environmentVariables[$index]['id'])) {
+            ApiEnvironmentVariable::find($this->environmentVariables[$index]['id'])?->delete();
+        }
+        unset($this->environmentVariables[$index]);
+        $this->environmentVariables = array_values($this->environmentVariables);
+    }
+
+    public function saveEnvironmentVariables()
+    {
+        if (!$this->editingEnvironment) return;
+
+        foreach ($this->environmentVariables as $varData) {
+            if (empty($varData['key'])) continue;
+
+            if ($varData['id']) {
+                // Update existing
+                ApiEnvironmentVariable::find($varData['id'])?->update([
+                    'key' => $varData['key'],
+                    'value' => $varData['value'],
+                    'description' => $varData['description'],
+                    'is_secret' => $varData['is_secret'],
+                    'enabled' => $varData['enabled'],
+                ]);
+            } else {
+                // Create new
+                ApiEnvironmentVariable::create([
+                    'environment_id' => $this->editingEnvironment->id,
+                    'key' => $varData['key'],
+                    'value' => $varData['value'],
+                    'description' => $varData['description'],
+                    'is_secret' => $varData['is_secret'],
+                    'enabled' => $varData['enabled'],
+                ]);
+            }
+        }
+
+        $this->editingEnvironment->refresh();
+        $this->loadEnvironments();
+        $this->environmentTab = 'list';
+        $this->editingEnvironment = null;
+    }
+
+    public function getAvailableVariables()
+    {
+        if (!$this->activeEnvironment) {
+            return [];
+        }
+
+        return $this->activeEnvironment->enabledVariables->map(function ($var) {
+            return [
+                'key' => $var->key,
+                'formatted_key' => '{{' . $var->key . '}}',  // Pre-formatted for display
+                'value' => $var->value,
+                'description' => $var->description,
+            ];
+        })->toArray();
+    }
+
+    public function interpolateVariables($text)
+    {
+        if (!$this->activeEnvironment || empty($text)) {
+            return $text;
+        }
+
+        $variables = $this->activeEnvironment->getVariablesArray();
+
+        return preg_replace_callback('/\{\{([a-zA-Z0-9_]+)\}\}/', function ($matches) use ($variables) {
+            $key = $matches[1];
+            return $variables[$key] ?? $matches[0]; // Return original if variable not found
+        }, $text);
+    }
+
+    public function interpolateArray($array)
+    {
+        if (!is_array($array)) return $array;
+
+        foreach ($array as $key => $value) {
+            if (is_string($value)) {
+                $array[$key] = $this->interpolateVariables($value);
+            } elseif (is_array($value)) {
+                $array[$key] = $this->interpolateArray($value);
+            }
+        }
+
+        return $array;
+    }
+
 
     public function render()
     {
